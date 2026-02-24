@@ -33,6 +33,7 @@ Usage:
 
 import argparse
 import asyncio
+import math
 import os
 import re
 import time
@@ -197,7 +198,7 @@ class PriceActionBot:
             return 0
         # shares = usdc / (price / 1_000_000) = usdc * 1_000_000 / price
         # Result in 6 decimals
-        return int((usdc_amount * 1_000_000 * 1_000_000) / price)
+        return math.ceil((usdc_amount * 1_000_000 * 1_000_000) / price)
 
     def get_position_usdc(self, state: AssetState, market_id: str) -> float:
         """Get current position in USDC for a market."""
@@ -240,31 +241,19 @@ class PriceActionBot:
             print(f"Relayer TX: {tx_hash}")
             print("Waiting for confirmation...")
 
-            # Wait for confirmation
-            from web3 import Web3
-            rpc_urls = {
-                137: "https://polygon-bor-rpc.publicnode.com",
-                43114: "https://api.avax.network/ext/bc/C/rpc",
-                84532: "https://sepolia.base.org",
-            }
-            rpc_url = rpc_urls.get(self.client.chain_id)
-            w3 = Web3(Web3.HTTPProvider(rpc_url))
-
+            # Wait for confirmation by polling allowance via API
             for _ in range(30):
                 try:
-                    receipt = w3.eth.get_transaction_receipt(tx_hash)
-                    if receipt:
-                        if receipt["status"] == 1:
-                            print(f"✓ Max USDC approval confirmed (gasless)")
-                            self.approved_settlements[settlement_address] = 2**256 - 1
-                        else:
-                            print(f"✗ Transaction failed!")
+                    allowance = self.client.get_usdc_allowance(spender=settlement_address)
+                    if allowance >= self.MAX_APPROVAL_THRESHOLD:
+                        print(f"✓ Max USDC approval confirmed (gasless)")
+                        self.approved_settlements[settlement_address] = allowance
                         break
                 except Exception:
                     pass
-                time.sleep(1)
+                time.sleep(2)
             else:
-                print(f"⚠ Transaction pending (may still confirm)")
+                print(f"⚠ Approval pending (may still confirm)")
                 self.approved_settlements[settlement_address] = 2**256 - 1
 
         except Exception as e:
@@ -773,26 +762,34 @@ class PriceActionBot:
                     await asyncio.sleep(retry_delay)
                     continue
 
+                # Collect all resolved markets first
+                resolved: list[tuple[str, str, AssetState]] = []
                 for market_id, contract_address, state in all_traded:
                     try:
                         resolution = self.client.get_resolution(market_id)
-                        if not (resolution and resolution.resolved):
-                            continue
+                        if resolution and resolution.resolved:
+                            resolved.append((market_id, contract_address, state))
                     except Exception:
                         continue
 
-                    try:
-                        result = self.client.claim_winnings(contract_address)
-                        tx_hash = result.get("txHash", result.get("tx_hash", "unknown"))
-                        print(f"[{state.asset}] 💰 Claimed winnings from {market_id[:8]}... TX: {tx_hash}")
-                        del state.traded_markets[market_id]
-                    except ValueError as e:
-                        if "no winning tokens" in str(e).lower():
-                            del state.traded_markets[market_id]
-                    except Exception as e:
-                        print(f"[{state.asset}] Claim error: {e}")
+                if not resolved:
+                    await asyncio.sleep(retry_delay)
+                    continue
 
-                    await asyncio.sleep(15)
+                # Batch claim in one transaction
+                market_addresses = [addr for _, addr, _ in resolved]
+                try:
+                    result = self.client.batch_claim_winnings(market_addresses)
+                    tx_hash = result.get("txHash", result.get("tx_hash", "unknown"))
+                    print(f"💰 Batch claimed {len(resolved)} markets TX: {tx_hash}")
+                    for market_id, _, state in resolved:
+                        del state.traded_markets[market_id]
+                except ValueError as e:
+                    if "no winning tokens" in str(e).lower():
+                        for market_id, _, state in resolved:
+                            del state.traded_markets[market_id]
+                except Exception as e:
+                    print(f"Batch claim error: {e}")
 
             except Exception as e:
                 print(f"Claim monitor error: {e}")

@@ -1625,7 +1625,7 @@ class TurbineClient:
             "chain_id": str(self._chain_id),
             "markets": ",".join(market_contract_addresses),
         }
-        response = self._http.get(endpoint, params=params)
+        response = self._http.get(endpoint, params=params, authenticated=True)
         markets_data = response.get("markets", [])
 
         redemptions = []

@@ -621,30 +621,19 @@ class MarketMaker:
             print(f"Relayer TX: {tx_hash}")
             print("Waiting for confirmation...")
 
-            from web3 import Web3
-            rpc_urls = {
-                137: "https://polygon-bor-rpc.publicnode.com",
-                43114: "https://api.avax.network/ext/bc/C/rpc",
-                84532: "https://sepolia.base.org",
-            }
-            rpc_url = rpc_urls.get(self.client.chain_id)
-            w3 = Web3(Web3.HTTPProvider(rpc_url))
-
+            # Wait for confirmation by polling allowance via API
             for _ in range(30):
                 try:
-                    receipt = w3.eth.get_transaction_receipt(tx_hash)
-                    if receipt:
-                        if receipt["status"] == 1:
-                            print(f"Max USDC approval confirmed (gasless)")
-                            self.approved_settlements[settlement_address] = 2**256 - 1
-                        else:
-                            print(f"Transaction failed!")
+                    allowance = self.client.get_usdc_allowance(spender=settlement_address)
+                    if allowance >= self.MAX_APPROVAL_THRESHOLD:
+                        print(f"Max USDC approval confirmed (gasless)")
+                        self.approved_settlements[settlement_address] = allowance
                         break
                 except Exception:
                     pass
-                time.sleep(1)
+                time.sleep(2)
             else:
-                print(f"Transaction pending (may still confirm)")
+                print(f"Approval pending (may still confirm)")
                 self.approved_settlements[settlement_address] = 2**256 - 1
 
         except Exception as e:
