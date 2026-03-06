@@ -252,6 +252,7 @@ class KellyBot:
         min_pct_edge: float = DEFAULT_MIN_PCT_EDGE,
         min_abs_edge: float = DEFAULT_MIN_ABS_EDGE,
         max_position_usdc: float = DEFAULT_MAX_POSITION_USDC,
+        dry_run: bool = False,
     ):
         self.client = client
         self.assets = assets
@@ -260,7 +261,14 @@ class KellyBot:
         self.min_pct_edge = min_pct_edge
         self.min_abs_edge = min_abs_edge
         self.max_position_usdc = max_position_usdc
+        self.dry_run = dry_run
         self.running = True
+
+        # Dry-run simulation state
+        self.sim_balance: float = bankroll_usdc
+        self.sim_pnl: float = 0.0
+        # {market_id: {"outcome": Outcome, "price": float, "usdc": float, "shares": float}}
+        self.sim_positions: dict[str, dict] = {}
 
         self.asset_states: dict[str, AssetState] = {
             asset: AssetState(asset) for asset in assets
@@ -475,6 +483,25 @@ class KellyBot:
         )
         position_usdc = max(position_usdc, MIN_ORDER_USDC)
 
+        if self.dry_run:
+            if position_usdc > self.sim_balance:
+                print(f"[{state.asset}] [SIM] Insufficient sim balance: ${self.sim_balance:.3f}")
+                return
+            outcome = Outcome.YES if action == "BUY_YES" else Outcome.NO
+            price = limit_price / 1_000_000
+            shares = position_usdc / price
+            self.sim_balance -= position_usdc
+            self.sim_positions[state.market_id] = {
+                "outcome": outcome, "price": price,
+                "usdc": position_usdc, "shares": shares, "asset": state.asset,
+            }
+            print(
+                f"[{state.asset}] [SIM] {action} @ {price:.1%} — "
+                f"${position_usdc:.3f} → {shares:.4f} shares | "
+                f"sim balance: ${self.sim_balance:.3f} | pnl: ${self.sim_pnl:+.3f}"
+            )
+            return
+
         if not self.can_trade(state, position_usdc):
             current = self.get_position_usdc(state, state.market_id)
             print(f"[{state.asset}] Position cap: ${current:.2f} / ${self.max_position_usdc:.2f}")
@@ -621,7 +648,7 @@ class KellyBot:
     # ----------------------------------------------------------
 
     def ensure_settlement_approved(self, settlement_address: str) -> None:
-        if settlement_address in self.approved_settlements:
+        if self.dry_run or settlement_address in self.approved_settlements:
             return
 
         current_allowance = self.client.get_usdc_allowance(spender=settlement_address)
@@ -925,6 +952,29 @@ class KellyBot:
     async def claim_resolved_markets(self) -> None:
         while self.running:
             try:
+                if self.dry_run:
+                    for market_id, pos in list(self.sim_positions.items()):
+                        try:
+                            resolution = self.client.get_resolution(market_id)
+                            if resolution and resolution.resolved:
+                                won = (pos["outcome"] == Outcome.YES and resolution.result == "YES") or \
+                                      (pos["outcome"] == Outcome.NO and resolution.result == "NO")
+                                payout = pos["shares"] if won else 0.0
+                                trade_pnl = payout - pos["usdc"]
+                                self.sim_pnl += trade_pnl
+                                self.sim_balance += payout
+                                result_str = "WON" if won else "LOST"
+                                print(
+                                    f"[{pos['asset']}] [SIM] Market resolved {resolution.result} — "
+                                    f"{result_str} ${trade_pnl:+.3f} | "
+                                    f"sim balance: ${self.sim_balance:.3f} | total pnl: ${self.sim_pnl:+.3f}"
+                                )
+                                del self.sim_positions[market_id]
+                        except Exception:
+                            continue
+                    await asyncio.sleep(120)
+                    continue
+
                 all_traded: list[tuple[str, str, AssetState]] = []
                 for state in self.asset_states.values():
                     for market_id, contract_address in list(state.traded_markets.items()):
@@ -1023,6 +1073,9 @@ async def main():
     parser.add_argument("-a", "--assets", type=str,
                         default=os.environ.get("ASSETS", ",".join(SUPPORTED_ASSETS)),
                         help=f"Assets to trade (default: {','.join(SUPPORTED_ASSETS)})")
+    parser.add_argument("--dry-run", action="store_true",
+                        default=os.environ.get("DRY_RUN", "false").lower() == "true",
+                        help="Simulate trading without placing real orders")
     args = parser.parse_args()
 
     assets = [a.strip().upper() for a in args.assets.split(",")]
@@ -1056,13 +1109,16 @@ async def main():
     print(f"Kelly:       {args.kelly_scalar:.0%} of full Kelly")
     print(f"Min edge:    {args.min_pct_edge:.0%} pct / {args.min_abs_edge:.0%} abs")
     print(f"Max pos:     ${args.max_position:.2f} per asset")
-    try:
-        balance = client.get_usdc_balance() / 1_000_000
-        print(f"USDC bal:    ${balance:.2f}")
-        if balance < args.min_abs_edge * len(assets):
-            print(f"  Warning: low balance. Fund wallet: {client.address}")
-    except Exception as e:
-        print(f"USDC bal:    unknown ({e})")
+    if args.dry_run:
+        print(f"Mode:        DRY RUN (no real orders — sim balance: ${args.bankroll:.2f})")
+    else:
+        try:
+            balance = client.get_usdc_balance() / 1_000_000
+            print(f"USDC bal:    ${balance:.2f}")
+            if balance < args.min_abs_edge * len(assets):
+                print(f"  Warning: low balance. Fund wallet: {client.address}")
+        except Exception as e:
+            print(f"USDC bal:    unknown ({e})")
     print(f"{'='*60}\n")
 
     bot = KellyBot(
@@ -1073,6 +1129,7 @@ async def main():
         min_pct_edge=args.min_pct_edge,
         min_abs_edge=args.min_abs_edge,
         max_position_usdc=args.max_position,
+        dry_run=args.dry_run,
     )
 
     try:
