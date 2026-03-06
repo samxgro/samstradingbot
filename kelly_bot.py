@@ -1020,7 +1020,8 @@ async def main():
                         help=f"Min absolute edge to trade (default: {DEFAULT_MIN_ABS_EDGE})")
     parser.add_argument("--max-position", type=float, default=DEFAULT_MAX_POSITION_USDC,
                         help=f"Max USDC per asset per market (default: ${DEFAULT_MAX_POSITION_USDC})")
-    parser.add_argument("-a", "--assets", type=str, default=",".join(SUPPORTED_ASSETS),
+    parser.add_argument("-a", "--assets", type=str,
+                        default=os.environ.get("ASSETS", ",".join(SUPPORTED_ASSETS)),
                         help=f"Assets to trade (default: {','.join(SUPPORTED_ASSETS)})")
     args = parser.parse_args()
 
